@@ -1,0 +1,23 @@
+{
+  "name": "agent-ai-whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp gateway service — downloads media and forwards to Python agent",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@whiskeysockets/baileys": "^6.7.8",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "pino": "^9.4.0",
+    "qrcode-terminal": "^0.12.0",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
