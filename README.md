@@ -1,8 +1,25 @@
-# Agent AI — WhatsApp Petty Cash Agent
+# Twilight Agent
 
-An AI agent that watches WhatsApp groups for UPI payment screenshots and text
-commands, extracts petty cash data with an LLM, and writes it into the
-Twilight FleetZen Supabase database.
+**Twilight Agent** is Twilight FleetZen's internal AI agent platform — a
+growing set of automations that watch company WhatsApp groups, understand
+messages and screenshots with an LLM, and act on them (extracting data,
+writing to the FleetZen Supabase backend, replying/reacting in-chat).
+
+The architecture is deliberately split so new capabilities can be added as
+independent **tools** without touching the messaging layer:
+
+- **Gateway** (`src/`, Node.js + Baileys) — owns the WhatsApp connection,
+  filters to monitored groups, downloads media, and forwards messages to the
+  agent. This layer doesn't know or care what a message means.
+- **Agent** (`agent/`, Python + FastAPI) — owns understanding: an LLM picks
+  the right tool for each message (vision model for screenshots, chat model
+  for text/commands) and the tool does the extraction/validation/DB write.
+
+This repo currently ships the first module — **petty cash automation**
+(UPI screenshot extraction + opening-balance commands, detailed below) — but
+the gateway/agent split and the tool-registry pattern (`agent/agent/tool_registry.py`)
+are designed so future modules (fuel bills, expense approvals, driver
+reporting, etc.) are added as new tools rather than new services.
 
 ---
 
