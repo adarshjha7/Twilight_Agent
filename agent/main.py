@@ -18,9 +18,11 @@ from config import config
 from agent.tool_registry import registry
 from tools.petty_cash_extractor_tool import PettyCashExtractorTool
 from tools.set_opening_balance_tool import SetOpeningBalanceTool
+from tools.maintenance_bill_extractor_tool import MaintenanceBillExtractorTool
 
 registry.register(PettyCashExtractorTool())
 registry.register(SetOpeningBalanceTool())
+registry.register(MaintenanceBillExtractorTool())
 # ─────────────────────────────────────────────────────────────────────────────
 
 from agent.agent import run as agent_run

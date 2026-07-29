@@ -26,6 +26,15 @@ class Config:
     openrouter_chat_model: str = os.getenv("OPENROUTER_CHAT_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
     openrouter_timeout: int = int(os.getenv("OPENROUTER_TIMEOUT_MS", "90000")) // 1000
 
+    # Gemini — used only by the maintenance bill extractor, to match the real
+    # backend's extractBillJson() (same model/prompt/JSON-mode as the web
+    # "Upload Bill" dialog). Optional at startup — only required when that
+    # tool actually runs, checked there rather than here, so the rest of the
+    # agent (petty cash, etc.) works without it.
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_timeout: int = int(os.getenv("GEMINI_TIMEOUT_MS", "60000")) // 1000
+
     storage_dir: str = os.getenv("STORAGE_DIR", "./storage")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 

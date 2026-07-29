@@ -101,3 +101,27 @@ async def upsert(table: str, data: dict, on_conflict: str) -> _Result:
         )
         r.raise_for_status()
         return _Result(r.json())
+
+
+async def insert_ignore(table: str, data, on_conflict: str) -> _Result:
+    """INSERT row(s), silently skipping any that violate on_conflict (ON CONFLICT DO NOTHING)."""
+    headers = {**_HEADERS, "Prefer": "resolution=ignore-duplicates,return=representation"}
+    async with _client() as client:
+        r = await client.post(
+            f"{_BASE}/{table}",
+            headers=headers,
+            params={"on_conflict": on_conflict},
+            json=data,
+        )
+        r.raise_for_status()
+        return _Result(r.json())
+
+
+async def update(table: str, filters: dict, data: dict) -> _Result:
+    """PATCH rows matching filters. Filter values must be pre-formatted PostgREST
+    operators (e.g. {"vehicle_number": "eq.MH12AB1234", "current_odometer": "lt.5000"})."""
+    headers = {**_HEADERS, "Prefer": "return=representation"}
+    async with _client() as client:
+        r = await client.patch(f"{_BASE}/{table}", headers=headers, params=filters, json=data)
+        r.raise_for_status()
+        return _Result(r.json())
