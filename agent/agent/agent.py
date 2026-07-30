@@ -41,6 +41,16 @@ def _is_maintenance_chat(chat_name: str) -> bool:
     return _MAINTENANCE_CHAT_KEYWORD in (chat_name or "").lower()
 
 
+def _non_maintenance_tools() -> list[dict]:
+    """Every registered tool except extract_maintenance_bill. Used for every
+    non-maintenance chat's LLM tool-selection call (text messages, PDFs) so
+    the maintenance tool is never even offered as a candidate there — mirrors
+    the maintenance chat only ever seeing its own tool, in the other
+    direction. Without this, registry.to_llm_tools() would hand the LLM every
+    tool including this one, since they all share one global registry."""
+    return [t for t in registry.to_llm_tools() if t["function"]["name"] != _MAINTENANCE_TOOL_NAME]
+
+
 async def run(file_path: str, media_type: str, message_id: str, caption: str = "", chat_name: str = "") -> dict:
     logger.info(f"[Agent] Processing {media_type} — message_id: {message_id} — group: {chat_name}")
 
@@ -81,10 +91,12 @@ async def run(file_path: str, media_type: str, message_id: str, caption: str = "
             return {"success": False, "reason": "text messages are ignored in the maintenance group"}
 
         # Plain text messages (any group except maintenance, handled above):
-        # let LLM reason and pick the right tool
+        # let LLM reason and pick the right tool. Excludes the maintenance
+        # tool from the candidates — it's never a valid choice outside its
+        # own group (see _non_maintenance_tools).
         text = caption
         context["text"] = text
-        tools = registry.to_llm_tools()
+        tools = _non_maintenance_tools()
         logger.info(f"[Agent] Text message — available tools: {[t['function']['name'] for t in tools]}")
         decision = await chat_with_tools(TEXT_SYSTEM_PROMPT, f"Message:\n{text}", tools)
 
@@ -122,7 +134,9 @@ async def run(file_path: str, media_type: str, message_id: str, caption: str = "
 
     context["text"] = text
 
-    tools = registry.to_llm_tools()
+    # Same exclusion as the text branch — the maintenance tool is never a
+    # candidate for a PDF in a non-maintenance group.
+    tools = _non_maintenance_tools()
     logger.info(f"[Agent] Available tools: {[t['function']['name'] for t in tools]}")
     decision = await chat_with_tools(SYSTEM_PROMPT, f"Document content:\n---\n{text}\n---", tools)
 
