@@ -19,6 +19,25 @@ from config import config
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
+async def _call_gemini(prompt: str, file_path: str | None, api_key: str) -> httpx.Response:
+    parts = [{"text": prompt}]
+    if file_path:
+        mime_type = mimetypes.guess_type(file_path)[0] or "application/pdf"
+        with open(file_path, "rb") as f:
+            data_b64 = base64.b64encode(f.read()).decode("utf-8")
+        parts.append({"inline_data": {"mime_type": mime_type, "data": data_b64}})
+
+    url = _ENDPOINT.format(model=config.gemini_model)
+    headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+    body = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+
+    async with httpx.AsyncClient(timeout=config.gemini_timeout) as client:
+        return await client.post(url, headers=headers, json=body)
+
+
 async def extract_bill_json(prompt: str, file_path: str | None = None) -> str:
     """Calls Gemini with the extraction prompt and, if given, an attached file
     sent as inline_data (base64) — an image or PDF, exactly as the backend
@@ -29,22 +48,13 @@ async def extract_bill_json(prompt: str, file_path: str | None = None) -> str:
     if not config.gemini_api_key:
         raise EnvironmentError("GEMINI_API_KEY is not set in .env")
 
-    parts = [{"text": prompt}]
-    if file_path:
-        mime_type = mimetypes.guess_type(file_path)[0] or "application/pdf"
-        with open(file_path, "rb") as f:
-            data_b64 = base64.b64encode(f.read()).decode("utf-8")
-        parts.append({"inline_data": {"mime_type": mime_type, "data": data_b64}})
+    resp = await _call_gemini(prompt, file_path, config.gemini_api_key)
 
-    url = _ENDPOINT.format(model=config.gemini_model)
-    headers = {"Content-Type": "application/json", "X-goog-api-key": config.gemini_api_key}
-    body = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
-
-    async with httpx.AsyncClient(timeout=config.gemini_timeout) as client:
-        resp = await client.post(url, headers=headers, json=body)
+    # Free-tier quota exhausted on the primary key (a busy day of bills) —
+    # retry once on the fallback key before giving up.
+    if resp.status_code == 429 and config.gemini_api_key_fallback:
+        logger.warning("[Gemini] Primary key quota reached — retrying with fallback key")
+        resp = await _call_gemini(prompt, file_path, config.gemini_api_key_fallback)
 
     if resp.status_code != 200:
         # Same friendly-429 handling as the backend — Gemini's free-tier quota

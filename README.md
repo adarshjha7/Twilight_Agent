@@ -15,11 +15,13 @@ independent **tools** without touching the messaging layer:
   the right tool for each message (vision model for screenshots, chat model
   for text/commands) and the tool does the extraction/validation/DB write.
 
-This repo currently ships the first module — **petty cash automation**
-(UPI screenshot extraction + opening-balance commands, detailed below) — but
-the gateway/agent split and the tool-registry pattern (`agent/agent/tool_registry.py`)
-are designed so future modules (fuel bills, expense approvals, driver
-reporting, etc.) are added as new tools rather than new services.
+This repo currently ships two modules — **petty cash automation** (UPI
+screenshot extraction + opening-balance commands) and **maintenance bill
+automation** (garage/workshop bill extraction, detailed below) — but the
+gateway/agent split and the tool-registry pattern
+(`agent/agent/tool_registry.py`) are designed so future modules (fuel bills,
+expense approvals, driver reporting, etc.) are added as new tools rather than
+new services.
 
 ---
 
@@ -45,6 +47,11 @@ WhatsApp group message
                                                           • vendor_sub_categories
                                                           • petty_cash
                                                           • petty_cash_account_config
+                                                          • vehicles
+                                                          • maintenance_events
+                                                          • maintenance_line_items
+                                                          • maintenance_categories
+                                                          • parts_master
 ```
 
 | Component | Tech | Start command | Auto-reload? |
@@ -260,16 +267,152 @@ logged as a warning, **no reply is sent** (prevents the bot spamming groups).
 
 ---
 
+## Feature 7 — Maintenance bill extraction
+
+**Tool:** `extract_maintenance_bill` (`agent/tools/maintenance_bill_extractor_tool.py`)
+
+Dedicated to the **"Maintenance Payments and Bills"** WhatsApp group. Unlike Petty Cash
+(where the group name fixes the vendor), a maintenance bill's vendor and vehicle vary
+per bill, so both are resolved from the bill's own content against the live database —
+never guessed, never auto-created.
+
+**Flow:**
+1. Routing is chat-name based, not LLM-based: any group whose name contains
+   "maintenance" is hardcoded in `agent/agent/agent.py` to route straight to this tool
+   (images bypass tool selection entirely, same as Petty Cash; text/PDF messages in this
+   group are only ever offered this one tool, so they can never be misrouted to a
+   petty-cash tool). Adding this tool does not change what any other monitored group
+   resolves to.
+2. **Extraction calls Gemini directly** (`agent/llm/gemini_client.py`), not the
+   NVIDIA→OpenRouter chain every other tool uses — this is the one tool in the agent that
+   doesn't go through `llm_client.py`. Both the prompt (`BILL_EXTRACTION_PROMPT`, reused
+   verbatim from `twilight-fleetzen-backend/src/maintenance/maintenance.service.ts`) and
+   the model/call shape (`gemini-2.5-flash` by default, `generationConfig.responseMimeType:
+   "application/json"`) match the real backend's `extractBillJson()` exactly, so a bill
+   sent over WhatsApp is parsed the same way the web "Upload Bill" dialog's auto-fill
+   parses it. Images and PDFs are sent to Gemini as raw `inline_data` bytes — never
+   pre-flattened through OCR/`pdfplumber` first (the PDF pipeline every other tool uses)
+   — so Gemini sees the bill exactly as the browser upload does; `agent/agent/agent.py`
+   has a routing shortcut so PDFs in this group skip straight to this tool instead of
+   going through `pdfplumber` + LLM tool-selection. The returned nested JSON shape
+   (`parsed` — vendor, GSTIN, invoice no/date, odometer, grand total, tax breakdown, job
+   card/next-service/technician fields, `maintenance_type` asked directly as
+   `Scheduled`/`Unscheduled`, and `line_items[]` with `item_category` as
+   `PART/LABOR/LUBRICANT/OTHER` — plus `app_context.vehicle_number` and the multi-vehicle
+   `vehicle_groups`/`candidate_vehicles` arrays) is identical to what the backend consumes.
+   Requires `GEMINI_API_KEY` in `agent/.env` (see Environment below) — unlike
+   `NVIDIA_API_KEY`, there is **no fallback** if Gemini fails, matching the real backend's
+   own behaviour (it doesn't fall back either).
+3. **Vehicle** is looked up by exact/ILIKE match on `vehicles.vehicle_number` — a bill for
+   an unrecognised registration number is rejected, never inserted with an invented FK.
+4. **Vendor** is fuzzy-matched (ILIKE) against `vendors.display_name` / `legal_name`,
+   narrowed by GSTIN if extracted. Zero or ambiguous matches → rejected with the
+   candidate names listed, same reject-don't-guess pattern as Petty Cash's unknown-bank
+   check.
+5. **Category**: the real system's own `parsed.category_id` extraction field isn't
+   actionable (Gemini has no knowledge of the live category UUIDs, and per README §7.8
+   the app never auto-applies a guessed category FK anyway) — so this tool instead
+   keyword-matches the bill's own descriptive text (`raw_notes` + `workshop_branch` +
+   `vendor_name` + line item descriptions) against the live `maintenance_categories`
+   table (AC/tyre/body/showroom), defaulting to `GENERAL` — the app's own catch-all
+   bucket — rather than left null.
+6. **`maintenance_type`** is trusted directly from the model's `Scheduled`/`Unscheduled`
+   answer (re-validated against the real enum, defaulting to `UNSCHEDULED` if invalid) —
+   same as production trusts Gemini for this field. **`item_category`** is taken directly
+   as `PART`/`LABOR`/`LUBRICANT`, with `OTHER` (and anything else unrecognised) remapped
+   to `SUBLET` per README §7.4 (`OTHER` isn't a real DB value). **`uom`** free text is
+   mapped deterministically to the documented live values (`Nos`/`Liters`/`Kgs`/`Job`).
+7. **Multi-vehicle bills — each vehicle+bill combination becomes its own independent
+   `maintenance_events` row, matching the real `createEventsBatch()` flow:**
+   - If the bill (or the model's own Layout A/B/C split) already gives a per-vehicle
+     amount — `vehicle_groups[].line_items` — that amount is used directly for that
+     vehicle's event.
+   - If the model couldn't tell how charges divide (`candidate_vehicles`, no per-vehicle
+     line items), the bill's overall `grand_total` is split **equally** across every
+     candidate vehicle, each becoming its own event with a single lump-sum line item.
+   - **`invoice_no` is the bill's own value, unmodified and identical across every
+     vehicle in the batch** — same as production. The `(vendor_id, invoice_no)`
+     duplicate guard is existing backend behaviour and is not worked around.
+   - **All-or-nothing, mirroring `createEventsBatch()`'s shared transaction:** every
+     vehicle in the batch is first resolved, checked for a prior duplicate, and has its
+     line items/total worked out — all read-only, nothing written yet. Only if *every*
+     vehicle passes does the tool proceed to insert any of them; if any one fails
+     (unrecognised vehicle, already-recorded invoice for that vehicle, no usable
+     amount), the whole bill is rejected and **nothing is inserted**, not even for the
+     vehicles that would have passed. The duplicate check itself is scoped to
+     `(vendor_id, invoice_no, vehicle_number)` — several vehicles legitimately share one
+     `invoice_no` on a multi-vehicle bill, so checking only `(vendor_id, invoice_no)`
+     would wrongly flag the 2nd+ vehicle as a duplicate of the 1st.
+   - The one receipt photo is shared by every event in a multi-vehicle batch — uploaded
+     once to a `multi-vehicle/<timestamp>-<rand>.<ext>` path (same convention as the real
+     app's batch upload, README §3.2) rather than per vehicle.
+8. Insert order per event (only reached once every vehicle in the batch has already
+   passed validation): `maintenance_events` (with `metadata` populated from the
+   extracted tax breakdown, job card no., technician, next-service, etc.) → `parts_master`
+   (ON CONFLICT DO NOTHING, via `db.insert_ignore`) → `maintenance_line_items` →
+   conditional odometer bump (`vehicles.current_odometer` only moves forward, via
+   `db.update`) → bill image URL patched onto the event.
+9. Audit JSON written to `storage/processed_maintenance/<date>/` — a **separate**
+   directory from Petty Cash's `storage/processed/`, so each tool's 10-file retention
+   prunes only its own audit trail.
+
+**Known limitation — no true multi-table transaction:** the agent's `db.py` deliberately
+has no DELETE or RPC capability (see Known limitations below), so it cannot open a real
+database transaction spanning `maintenance_events` + `maintenance_line_items` the way
+`createEventsBatch()` does, nor roll back a row it already inserted. This tool gets as
+close as it can within that constraint by validating every vehicle in a batch *before*
+writing any of them (previous point) — so the ordinary failure modes (bad vehicle number,
+already-recorded invoice, no usable amount) correctly result in nothing being saved. The
+residual gap is a genuine failure *during* the write phase itself (a transient DB/network
+error, or a `maintenance_line_items` insert failing right after its `maintenance_events`
+row was created) — since every vehicle has already been validated by that point, this
+should be rare, but if it happens that one event is left orphaned with no line items
+(`_db.reason: "line_items_failed"`, or the same inside a multi-vehicle event's entry, with
+the orphaned `event_id`) rather than the whole batch rolling back, and needs manual cleanup
+via the app UI. Fully closing this gap would mean either a transactional RPC (which the DB
+guard also blocks) or authenticating against the real `/upload-bills-page/events` endpoint
+instead of writing to Supabase directly.
+
+**Test cases:**
+
+| # | Input | Expected result |
+|---|---|---|
+| 7.1 | Clear bill photo with valid vendor + vehicle + invoice no | Row inserted into `maintenance_events` + `maintenance_line_items`; ✅ reaction; reply with vehicle, total, event ID |
+| 7.2 | Bill for a vehicle number not in `vehicles` | NOT saved; ❌ reaction; "vehicle not recognised" reply |
+| 7.3 | Bill from a vendor with no match in `vendors` | NOT saved; ❌ reaction; "could not identify the vendor" reply |
+| 7.4 | Bill from a vendor name matching multiple rows, no GSTIN to disambiguate | NOT saved; ❌ reaction; reply lists the candidate vendor names |
+| 7.5 | Same invoice number + vendor sent twice | Second one NOT inserted; ⚠️ reaction; "already recorded" reply |
+| 7.6 | Bill with a part line item whose `part_no` isn't in `parts_master` yet | Part auto-registered (`ON CONFLICT DO NOTHING`), line item inserted normally |
+| 7.7 | Bill with a higher odometer reading than the vehicle's current one | `vehicles.current_odometer` bumped to the new value |
+| 7.8 | Bill with a lower/equal odometer reading | `vehicles.current_odometer` left unchanged |
+| 7.9 | Bill with no itemised breakdown, only a grand total | Saved as one synthetic `SUBLET` line item equal to the grand total |
+| 7.10 | Bill in a **non-maintenance** monitored group | Ignored by this tool entirely — routed to Petty Cash as before |
+| 7.11 | PDF bill in the maintenance group | Routed straight to this tool (no `pdfplumber`, no tool-selection call) — raw PDF bytes sent to Gemini as `inline_data`, same as an image |
+| 7.12 | Line item with `item_category` extracted as `OTHER` | Remapped to `SUBLET` before insert |
+| 7.13 | Bill with `vehicle_groups` giving each vehicle its own charges (Layout A/B, or an evenly-split Layout C) | One `maintenance_events` row per vehicle, each with that vehicle's own amount and the **same unmodified** `invoice_no`; ✅ reaction; reply lists all vehicles saved |
+| 7.14 | Bill with `candidate_vehicles` (model couldn't tell how charges split) | `grand_total` divided equally across every candidate vehicle, one event each with a lump-sum line item |
+| 7.15 | Multi-vehicle bill where one vehicle's registration number doesn't match `vehicles` | **Nothing in the batch is saved** (all-or-nothing, like `createEventsBatch()`) — reply names the failing vehicle; the other, otherwise-valid vehicles are not inserted either |
+| 7.16 | Multi-vehicle bill resent unchanged | Duplicate check is scoped per `(vendor_id, invoice_no, vehicle_number)`, so every vehicle is correctly detected as already recorded — no false "duplicate" on vehicle 2+ just because vehicle 1 shares the same invoice_no |
+
+---
+
 ## Environment (`Agent_AI/.env`)
 
 Key variables (see `.env.example`):
 
-- `WA_MONITORED_CHATS` — comma-separated group-name substrings to watch
+- `WA_MONITORED_CHATS` — comma-separated group-name substrings to watch. Must
+  include a substring matching **"Maintenance Payments and Bills"** (e.g. add
+  `Maintenance`) for the maintenance bill automation to receive that group's
+  messages — the gateway silently skips any group not listed here.
 - `AGENT_SERVICE_URL` — Python agent URL (default `http://localhost:8000`)
 - `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` — PostgREST access (service key
   bypasses RLS — keep this file out of git; `baileys_auth/` too)
 - `NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, model names, timeouts (NVIDIA falls
-  back to OpenRouter on error)
+  back to OpenRouter on error) — used by every tool **except** maintenance bill extraction
+- `GEMINI_API_KEY` — required for the maintenance bill tool specifically (Feature 7); it
+  does not use NVIDIA/OpenRouter and has no fallback if this is missing or Gemini errors.
+  `GEMINI_MODEL` (default `gemini-2.5-flash`) and `GEMINI_TIMEOUT_MS` (default `60000`)
+  are optional overrides.
 
 ## Running
 
@@ -295,6 +438,7 @@ Debug chat UI: `http://localhost:8000/` (WebSocket-fed view of processed entries
 | `logs/gateway.log` / `gateway-error.log` | Node gateway |
 | `storage/images/received/` → `processed/` | Screenshot files (moved after processing) |
 | `storage/processed/<date>/petty_cash_*.json` | Audit JSON per entry, incl. `_db` save status / errors / missing fields |
+| `storage/processed_maintenance/<date>/maintenance_*.json` | Same, for maintenance bills — separate directory so retention doesn't cross-evict Petty Cash's audit files |
 
 ## Known limitations
 
@@ -306,3 +450,19 @@ Debug chat UI: `http://localhost:8000/` (WebSocket-fed view of processed entries
 - `payment_mode` inference trusts UTR length; unusual refs default to `UPI`.
 - Numeric-only month formats ("07/2026") aren't parsed — use month names or
   `YYYY-MM`.
+- Maintenance bills are written directly to Supabase (no backend transaction),
+  so a `maintenance_line_items` insert failure after the `maintenance_events`
+  insert succeeded leaves an orphaned event with no line items (agent can't
+  DELETE to roll back) — surfaced as `_db.reason: "line_items_failed"` with the
+  event ID for manual cleanup. See Feature 7.
+- Maintenance vendor/vehicle resolution requires an exact-enough text match
+  against `vendors`/`vehicles` — a bill photo where the vendor name or
+  registration number is illegible gets rejected rather than guessed.
+- Multi-vehicle maintenance bills split into one event per vehicle (matching
+  `createEventsBatch`), with every vehicle validated before any of them are
+  written so an unrecognised vehicle or an already-recorded invoice correctly
+  saves nothing for the whole bill. The one gap versus the real backend's
+  shared DB transaction: a failure *during* the write phase itself (rare,
+  since validation already passed) isn't rolled back, since the agent can't
+  DELETE. `invoice_no` is never modified — it's identical across every
+  vehicle in a batch, same as production. See Feature 7.

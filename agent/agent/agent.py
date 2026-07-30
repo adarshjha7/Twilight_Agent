@@ -28,26 +28,10 @@ Rules:
 - Only reply in plain text if the message truly matches no tool (e.g. casual chit-chat).
 - Do not add explanations — just make the tool call."""
 
-MAINTENANCE_SYSTEM_PROMPT = """You are an AI agent for a company's Maintenance module. You receive vehicle
-maintenance bills, invoices, and repair receipts sent via WhatsApp. Extract and record the bill.
-
-Rules:
-- Always choose exactly one tool.
-- If no tool fits, reply in plain text explaining why.
-- Do not add explanations — just make the tool call."""
-
-MAINTENANCE_TEXT_SYSTEM_PROMPT = """You are an AI agent for a company's Maintenance module. You receive plain
-text WhatsApp messages describing a vehicle maintenance bill (vendor, invoice number, amount, items). Extract
-and record it.
-
-Rules:
-- Always choose exactly one tool.
-- Only reply in plain text if the message truly matches no tool (e.g. casual chit-chat).
-- Do not add explanations — just make the tool call."""
-
 # The "Maintenance Payments and Bills" WhatsApp group is dedicated to bills —
-# route it to its own tool and its own (single-tool) LLM tool list so it can
-# never be misrouted into petty-cash tools, and so adding this tool never
+# routed straight to its own tool for both images and PDFs (no LLM tool
+# selection needed, since there's only one tool), and text is ignored
+# entirely (bills only ever arrive as image/PDF). Adding this tool never
 # changes what any other monitored group's messages resolve to.
 _MAINTENANCE_CHAT_KEYWORD = "maintenance"
 _MAINTENANCE_TOOL_NAME = "extract_maintenance_bill"
@@ -55,10 +39,6 @@ _MAINTENANCE_TOOL_NAME = "extract_maintenance_bill"
 
 def _is_maintenance_chat(chat_name: str) -> bool:
     return _MAINTENANCE_CHAT_KEYWORD in (chat_name or "").lower()
-
-
-def _maintenance_tools() -> list[dict]:
-    return [t for t in registry.to_llm_tools() if t["function"]["name"] == _MAINTENANCE_TOOL_NAME]
 
 
 async def run(file_path: str, media_type: str, message_id: str, caption: str = "", chat_name: str = "") -> dict:
@@ -90,13 +70,23 @@ async def run(file_path: str, media_type: str, message_id: str, caption: str = "
         return {"success": True, "tool": tool_name, "result": result}
 
     if media_type == "text":
-        # Plain text messages: let LLM reason and pick the right tool
+        # Maintenance bills only ever arrive as an image or PDF — a text
+        # message in that group is ordinary chat (mentions, banter, etc.),
+        # never bill data, so it's ignored outright rather than run through
+        # the bill-extraction prompt (which would otherwise return a mostly
+        # empty/garbage JSON for a chat message and fail on the missing
+        # grand_total). No tool call, no reply, no reaction — quiet skip.
+        if maintenance_chat:
+            logger.info("[Agent] Text message in maintenance group — ignored (bills only arrive as image/PDF)")
+            return {"success": False, "reason": "text messages are ignored in the maintenance group"}
+
+        # Plain text messages (any group except maintenance, handled above):
+        # let LLM reason and pick the right tool
         text = caption
         context["text"] = text
-        tools = _maintenance_tools() if maintenance_chat else registry.to_llm_tools()
-        system_prompt = MAINTENANCE_TEXT_SYSTEM_PROMPT if maintenance_chat else TEXT_SYSTEM_PROMPT
+        tools = registry.to_llm_tools()
         logger.info(f"[Agent] Text message — available tools: {[t['function']['name'] for t in tools]}")
-        decision = await chat_with_tools(system_prompt, f"Message:\n{text}", tools)
+        decision = await chat_with_tools(TEXT_SYSTEM_PROMPT, f"Message:\n{text}", tools)
 
         if "text" in decision:
             # The LLM sometimes answers in plain text (asking for a missing
@@ -104,10 +94,9 @@ async def run(file_path: str, media_type: str, message_id: str, caption: str = "
             # reaches WhatsApp. If the message has opening-balance intent, force
             # the tool: it parses the raw text itself and replies asking for
             # whatever is missing. Substring checks tolerate typos like
-            # "openig abalcen". Not applicable in the maintenance group, which
-            # has no opening-balance concept.
+            # "openig abalcen".
             lower = text.lower()
-            if not maintenance_chat and "bal" in lower and ("open" in lower or "ob" in lower.split()):
+            if "bal" in lower and ("open" in lower or "ob" in lower.split()):
                 tool = registry.get("set_opening_balance")
                 if tool:
                     logger.info("[Agent] LLM gave plain text but opening-balance intent detected — forcing set_opening_balance")

@@ -32,6 +32,9 @@ class Config:
     # tool actually runs, checked there rather than here, so the rest of the
     # agent (petty cash, etc.) works without it.
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    # Second key tried when the primary hits its free-tier quota (429) — a
+    # busy day of bills shouldn't just stop processing until the quota resets.
+    gemini_api_key_fallback: str = os.getenv("GEMINI_API_KEY_FALLBACK", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     gemini_timeout: int = int(os.getenv("GEMINI_TIMEOUT_MS", "60000")) // 1000
 

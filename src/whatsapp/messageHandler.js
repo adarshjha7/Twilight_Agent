@@ -46,11 +46,11 @@ async function processJob(job) {
     const outcome = response.data;
 
     if (outcome.success) {
-      logger.info(`[WA] Done — vendor: ${outcome.result?.vendor_name}`);
-      console.log('\n========== EXTRACTED PETTY CASH JSON ==========');
+      logger.info(`[WA] Done — tool: ${outcome.tool}`);
+      console.log(`\n========== EXTRACTED ${outcome.tool?.toUpperCase()} JSON ==========`);
       console.log(JSON.stringify(outcome.result, null, 2));
       console.log('================================================\n');
-      const handled = await sendPettyCashFeedback(message, outcome.result);
+      const handled = await sendToolFeedback(message, outcome);
       if (!handled) await message.react('✅').catch(() => {});
     } else {
       logger.warn(`[WA] Agent could not process: ${outcome.reason}`);
@@ -153,6 +153,120 @@ async function sendPettyCashFeedback(message, result) {
   return false;
 }
 
+// One-line summary of a single vehicle+bill event's outcome, used both for a
+// single-vehicle bill's reply and for each row of a multi-vehicle bill's reply.
+function describeEventOutcome(e) {
+  const who = e.vehicle_number || e.vehicle_raw || '(unresolved vehicle)';
+  if (e.saved) {
+    const total = Number(e.grand_total || 0);
+    const note = e.vendor_note ? ' ⚠️ vendor not matched, saved as unassigned' : '';
+    return `✅ ${who}: ₹${total.toLocaleString('en-IN')} (event #${e.event_id})${note}`;
+  }
+  switch (e.reason) {
+    case 'vehicle_not_found':
+      return `❌ ${who}: vehicle not recognised`;
+    case 'duplicate':
+      return `⚠️ ${who}: already recorded${e.existing_event_id ? ` (event #${e.existing_event_id})` : ''}`;
+    case 'amount_unresolved':
+      return `❌ ${who}: could not determine an amount for this vehicle`;
+    case 'line_items_failed':
+      return `⚠️ ${who}: bill saved (event #${e.orphaned_event_id}) but its line items failed — contact admin`;
+    default:
+      return `❌ ${who}: not saved${e.detail ? ` (${e.detail})` : ''}`;
+  }
+}
+
+// Reacts + replies based on the maintenance bill DB status the agent returned.
+// Same reject-don't-guess philosophy as sendPettyCashFeedback: vehicle/vendor
+// that can't be confidently resolved is reported back to the sender rather
+// than saved against a guess.
+async function sendMaintenanceFeedback(message, result) {
+  const dbStatus = result?._db;
+  if (!dbStatus) return false;
+
+  if (dbStatus.multi_vehicle && !dbStatus.events) {
+    // Batch failed validation before anything was written — mirrors
+    // createEventsBatch()'s all-or-nothing guarantee: one vehicle failing
+    // means none of the batch is saved, so nothing here has been recorded.
+    await message.react('❌').catch(() => {});
+    await sendReply(
+      message,
+      `❌ *Multi-vehicle bill NOT saved — nothing was recorded.*\n${describeEventOutcome({ saved: false, ...dbStatus })}\n\n` +
+      `Fix the issue above and resend the whole bill.`
+    );
+    return true;
+  }
+
+  if (dbStatus.multi_vehicle) {
+    const events = dbStatus.events || [];
+    const savedCount = events.filter((e) => e.saved).length;
+    const emoji = savedCount === events.length ? '✅' : savedCount > 0 ? '⚠️' : '❌';
+    await message.react(emoji).catch(() => {});
+    const lines = events.map((e) => `  ${describeEventOutcome(e)}`).join('\n');
+    const extra = dbStatus.unattributed_rows
+      ? `\n\n(${dbStatus.unattributed_rows} row(s) on this bill weren't tied to any vehicle and were skipped.)`
+      : '';
+    await sendReply(
+      message,
+      `${emoji} *Multi-vehicle bill — ${savedCount}/${events.length} vehicles saved:*\n${lines}${extra}`
+    );
+    return true;
+  }
+
+  if (dbStatus.saved) {
+    await message.react(dbStatus.vendor_note ? '⚠️' : '✅').catch(() => {});
+    const total = Number(dbStatus.grand_total || 0);
+    const vendorLine = dbStatus.vendor_note
+      ? `\n⚠️ Vendor not matched (saved as unassigned): ${dbStatus.vendor_note}`
+      : '';
+    await sendReply(
+      message,
+      `✅ *Maintenance bill saved!*\n🚗 Vehicle: ${dbStatus.vehicle_number}\n💰 Total: ₹${total.toLocaleString('en-IN')}\n🧾 Event ID: ${dbStatus.event_id}${vendorLine}`
+    );
+    return true;
+  }
+
+  switch (dbStatus.reason) {
+    case 'vehicle_not_found':
+      await message.react('❌').catch(() => {});
+      await sendReply(
+        message,
+        `❌ *Bill NOT saved — vehicle not recognised.*\n${dbStatus.detail}\n\nPlease check the registration number and resend.`
+      );
+      return true;
+    case 'duplicate':
+      await message.react('⚠️').catch(() => {});
+      await sendReply(
+        message,
+        `⚠️ This invoice is already recorded${dbStatus.existing_event_id ? ` (event #${dbStatus.existing_event_id})` : ''} — skipped duplicate.`
+      );
+      return true;
+    case 'amount_unresolved':
+      await message.react('❌').catch(() => {});
+      await sendReply(message, `❌ *Bill NOT saved — could not determine an amount.*\n${dbStatus.detail || ''}`);
+      return true;
+    case 'line_items_failed':
+      await message.react('❌').catch(() => {});
+      await sendReply(
+        message,
+        `⚠️ Bill was partially saved (event #${dbStatus.orphaned_event_id}) but its line items failed to save — please contact admin to fix this entry.`
+      );
+      return true;
+    default:
+      await message.react('❌').catch(() => {});
+      await sendReply(message, `❌ *Bill NOT saved.*\n${dbStatus.detail || 'Please resend a clearer photo of the bill.'}`);
+      return true;
+  }
+}
+
+// Dispatches to the right feedback function based on which tool the agent ran.
+function sendToolFeedback(message, outcome) {
+  if (outcome.tool === 'extract_maintenance_bill') {
+    return sendMaintenanceFeedback(message, outcome.result);
+  }
+  return sendPettyCashFeedback(message, outcome.result);
+}
+
 async function handleMessage(message) {
   const chat = await message.getChat();
   const chatName = chat.name || chat.id.user;
@@ -193,9 +307,9 @@ async function handleMessage(message) {
       if (reply) {
         await sendReply(message, reply);
       } else {
-        // Petty cash entries extracted from text have no reply field —
-        // report their DB save status the same way as screenshots.
-        await sendPettyCashFeedback(message, outcome.result);
+        // Petty cash / maintenance entries extracted from text have no reply
+        // field — report their DB save status the same way as screenshots.
+        await sendToolFeedback(message, outcome);
       }
 
       if (outcome.success) {

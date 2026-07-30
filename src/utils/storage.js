@@ -4,9 +4,17 @@ const config = require('../config');
 
 const IMAGE_KEEP_COUNT = 10;
 
+// Resolved once to an absolute path (STORAGE_DIR is typically relative, e.g.
+// "./storage"). The gateway and the Python agent run from different working
+// directories (repo root vs agent/), so a relative path saved here would
+// resolve to two different locations depending on which process reads it —
+// every filePath handed back from this module (and forwarded to the agent's
+// /process endpoint) must be absolute for the agent to find the same file.
+const STORAGE_ROOT = path.resolve(config.storage.dir);
+
 function getTodayFolder(subDir) {
   const today = new Date().toISOString().slice(0, 10);
-  const dir = path.join(config.storage.dir, subDir, today);
+  const dir = path.join(STORAGE_ROOT, subDir, today);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -28,7 +36,7 @@ function saveFile(buffer, filename, subDir = 'raw') {
  * Returns the absolute path of the saved file.
  */
 function saveImage(buffer, filename) {
-  const dir = path.join(config.storage.dir, 'images', 'received');
+  const dir = path.join(STORAGE_ROOT, 'images', 'received');
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, filename);
   fs.writeFileSync(filePath, buffer);
@@ -41,7 +49,7 @@ function saveImage(buffer, filename) {
  * Returns the new absolute path.
  */
 function moveImageToProcessed(filePath) {
-  const dir = path.join(config.storage.dir, 'images', 'processed');
+  const dir = path.join(STORAGE_ROOT, 'images', 'processed');
   fs.mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, path.basename(filePath));
   fs.renameSync(filePath, dest);
@@ -83,7 +91,7 @@ function cleanupOldData() {
   const retentionDays = config.storage.retentionDays;
 
   ['raw', 'processed'].forEach((subDir) => {
-    const dir = path.join(config.storage.dir, subDir);
+    const dir = path.join(STORAGE_ROOT, subDir);
     if (!fs.existsSync(dir)) return;
     fs.readdirSync(dir).forEach((name) => {
       if (!DATE_FOLDER_RE.test(name)) return;
@@ -92,7 +100,7 @@ function cleanupOldData() {
     });
   });
 
-  const receivedDir = path.join(config.storage.dir, 'images', 'received');
+  const receivedDir = path.join(STORAGE_ROOT, 'images', 'received');
   if (fs.existsSync(receivedDir)) {
     const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
     fs.readdirSync(receivedDir).forEach((name) => {
