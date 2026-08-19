@@ -25,6 +25,21 @@ const config = {
     level: process.env.LOG_LEVEL || 'info',
     dir: process.env.LOG_DIR || './logs',
   },
+  inspection: {
+    // Substring match against groups the bot is already in (see
+    // sendToGroupByName in whatsapp/client.js) — not required, so an
+    // unset value disables the scheduler without crashing the gateway.
+    groupName: process.env.INSPECTION_WA_GROUP || '',
+    timezone: process.env.INSPECTION_TIMEZONE || 'Asia/Kolkata',
+    adminPort: parseInt(process.env.GATEWAY_ADMIN_PORT || '8091', 10),
+    // Comma-separated, country code + number, digits only, no "+"/spaces
+    // (e.g. "917896890802") — tagged on every reminder message. Empty/unset
+    // means no mentions, not an error.
+    mentionNumbers: (process.env.INSPECTION_MENTION_NUMBERS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  },
 };
 
 module.exports = config;

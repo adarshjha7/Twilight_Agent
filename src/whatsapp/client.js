@@ -118,6 +118,33 @@ function adaptMessage(raw) {
   };
 }
 
+// Resolves a group name (substring, case-insensitive) to a jid by asking the
+// LIVE socket for every group the bot currently participates in — no new
+// connection, no new auth, just a lookup against the existing session.
+async function findGroupJidByName(nameSubstring) {
+  if (!currentSock) throw new Error('WhatsApp socket not ready');
+  const groups = await currentSock.groupFetchAllParticipating();
+  const needle = nameSubstring.toLowerCase();
+  const match = Object.values(groups).find((g) => (g.subject || '').toLowerCase().includes(needle));
+  return match ? match.id : null;
+}
+
+// Sends a plain-text message to a group resolved by name, reusing the SAME
+// live socket every other send/reply/react in this module uses — this is
+// the only way any other feature in this project should message a group by
+// name; it must never call makeWASocket() itself.
+//
+// mentionNumbers (optional): country-code+number, digits only, e.g.
+// "917896890802" — text must separately contain "@<same digits>" for
+// WhatsApp to render the highlighted tag; this array is what actually
+// triggers the mention/notification, the "@digits" text alone does nothing.
+async function sendToGroupByName(nameSubstring, text, mentionNumbers = []) {
+  const jid = await findGroupJidByName(nameSubstring);
+  if (!jid) throw new Error(`No WhatsApp group found matching "${nameSubstring}"`);
+  const mentions = mentionNumbers.map((n) => `${n}@s.whatsapp.net`);
+  await currentSock.sendMessage(jid, { text, mentions });
+}
+
 async function startWhatsApp(onMessage) {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
@@ -187,4 +214,4 @@ async function startWhatsApp(onMessage) {
   return sock;
 }
 
-module.exports = { startWhatsApp };
+module.exports = { startWhatsApp, sendToGroupByName };

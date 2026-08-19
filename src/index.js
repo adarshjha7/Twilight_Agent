@@ -5,6 +5,8 @@ const { handleMessage } = require('./whatsapp/messageHandler');
 const { cleanupOldData } = require('./utils/storage');
 const logger = require('./utils/logger');
 const config = require('./config');
+const { schedule: scheduleInspectionJobs, runJob: runInspectionJob } = require('./scheduler/inspectionScheduler');
+const { startAdminServer } = require('./adminServer');
 
 logger.info('Starting WhatsApp service...');
 logger.info(`Monitoring chats  : ${config.whatsapp.monitoredChats.join(', ')}`);
@@ -20,6 +22,22 @@ function runCleanup() {
 }
 runCleanup();
 setInterval(runCleanup, CLEANUP_INTERVAL_MS);
+
+// Inspection reminder scheduler — pure addition, reuses the WhatsApp socket
+// started below (never opens a second connection). Wrapped so a config/DB
+// problem here can never take down the WhatsApp connection itself.
+try {
+  scheduleInspectionJobs();
+  startAdminServer(
+    {
+      'post-trip': () => runInspectionJob('post-trip-manual', { type: 'Post-Trip', offsetDays: -1 }),
+      'pre-trip': () => runInspectionJob('pre-trip-manual', { type: 'Pre-Trip', offsetDays: 0 }),
+    },
+    config.inspection.adminPort
+  );
+} catch (err) {
+  logger.error(`Inspection scheduler setup failed (WhatsApp connection unaffected): ${err.message}`);
+}
 
 // Deduplicate: WhatsApp redelivers recent messages whenever the connection
 // bounces, which can be MINUTES after the original — a short time window is
