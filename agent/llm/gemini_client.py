@@ -10,6 +10,7 @@ tool keep using llm_client's NVIDIA→OpenRouter chain; this client is not part
 of that dispatcher on purpose.
 """
 
+import asyncio
 import base64
 import mimetypes
 import httpx
@@ -17,6 +18,7 @@ from loguru import logger
 from config import config
 
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_RETRY_DELAY_SECONDS = 2  # 503 "high demand" usually clears within a couple seconds
 
 
 async def _call_gemini(prompt: str, file_path: str | None, api_key: str) -> httpx.Response:
@@ -50,11 +52,25 @@ async def extract_bill_json(prompt: str, file_path: str | None = None) -> str:
 
     resp = await _call_gemini(prompt, file_path, config.gemini_api_key)
 
-    # Free-tier quota exhausted on the primary key (a busy day of bills) —
-    # retry once on the fallback key before giving up.
-    if resp.status_code == 429 and config.gemini_api_key_fallback:
-        logger.warning("[Gemini] Primary key quota reached — retrying with fallback key")
+    # 503 = Gemini's own servers overloaded ("high demand"), usually clears
+    # within a couple seconds — retry the SAME key once before giving up on
+    # it. (Not done for 429 — quota exhaustion won't clear in 2 seconds.)
+    if resp.status_code == 503:
+        logger.warning(f"[Gemini] Primary key got 503 (high demand) — retrying same key in {_RETRY_DELAY_SECONDS}s")
+        await asyncio.sleep(_RETRY_DELAY_SECONDS)
+        resp = await _call_gemini(prompt, file_path, config.gemini_api_key)
+
+    # Still failing — quota exhausted (429) or still overloaded (503) — try
+    # the fallback key, which can land on a different quota/backend.
+    if resp.status_code in (429, 503) and config.gemini_api_key_fallback:
+        logger.warning(f"[Gemini] Primary key failed ({resp.status_code}) — retrying with fallback key")
         resp = await _call_gemini(prompt, file_path, config.gemini_api_key_fallback)
+
+        # Same "usually clears in a couple seconds" logic applies here too.
+        if resp.status_code == 503:
+            logger.warning(f"[Gemini] Fallback key got 503 (high demand) — retrying fallback key in {_RETRY_DELAY_SECONDS}s")
+            await asyncio.sleep(_RETRY_DELAY_SECONDS)
+            resp = await _call_gemini(prompt, file_path, config.gemini_api_key_fallback)
 
     if resp.status_code != 200:
         # Same friendly-429 handling as the backend — Gemini's free-tier quota
